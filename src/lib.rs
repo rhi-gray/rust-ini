@@ -71,17 +71,12 @@ pub enum EscapePolicy {
     /// (i.e. between U+007F - U+FFFF)
     /// Codepoints above U+FFFF, e.g. '🐱' U+1F431 "CAT FACE" will *not* be escaped!
     BasicsUnicode,
-    /// Escape basics and all non-ASCII characters, including codepoints above U+FFFF.
-    /// This will escape emoji - if you want them to remain raw, use BasicsUnicode instead.
-    BasicsUnicodeExtended,
     /// Escape reserved symbols.
     /// This includes everything in EscapePolicy::Basics, plus the comment characters ';' and '#' and the key/value-separating characters '=' and ':'.
     Reserved,
     /// Escape reserved symbols and non-ASCII characters in the BMP.
     /// Codepoints above U+FFFF, e.g. '🐱' U+1F431 "CAT FACE" will *not* be escaped!
     ReservedUnicode,
-    /// Escape reserved symbols and all non-ASCII characters, including codepoints above U+FFFF.
-    ReservedUnicodeExtended,
     /// Escape everything that some INI implementations assume
     Everything,
 }
@@ -98,7 +93,6 @@ impl EscapePolicy {
         match self {
             EscapePolicy::Reserved => true,
             EscapePolicy::ReservedUnicode => true,
-            EscapePolicy::ReservedUnicodeExtended => true,
             EscapePolicy::Everything => true,
             _ => false,
         }
@@ -107,18 +101,7 @@ impl EscapePolicy {
     fn escape_unicode(self) -> bool {
         match self {
             EscapePolicy::BasicsUnicode => true,
-            EscapePolicy::BasicsUnicodeExtended => true,
             EscapePolicy::ReservedUnicode => true,
-            EscapePolicy::ReservedUnicodeExtended => true,
-            EscapePolicy::Everything => true,
-            _ => false,
-        }
-    }
-
-    fn escape_unicode_extended(self) -> bool {
-        match self {
-            EscapePolicy::BasicsUnicodeExtended => true,
-            EscapePolicy::ReservedUnicodeExtended => true,
             EscapePolicy::Everything => true,
             _ => false,
         }
@@ -133,7 +116,6 @@ impl EscapePolicy {
             '\\' | '\x00'..='\x1f' | '\x7f' => self.escape_basics(),
             ';' | '#' | '=' | ':' => self.escape_reserved(),
             '\u{0080}'..='\u{FFFF}' => self.escape_unicode(),
-            '\u{10000}'..='\u{10FFFF}' => self.escape_unicode_extended(),
             _ => false,
         }
     }
@@ -179,9 +161,6 @@ fn escape_str(s: &str, policy: EscapePolicy) -> String {
             '\t' => escaped.push_str("\\t"),
             '\r' => escaped.push_str("\\r"),
             '\u{0080}'..='\u{FFFF}' => escaped.push_str(&format!("\\x{:04x}", c as isize)[..]),
-            // Longer escapes.
-            '\u{10000}'..='\u{FFFFF}' => escaped.push_str(&format!("\\x{:05x}", c as isize)[..]),
-            '\u{100000}'..='\u{10FFFF}' => escaped.push_str(&format!("\\x{:06x}", c as isize)[..]),
             _ => {
                 escaped.push('\\');
                 escaped.push(c);
@@ -2334,8 +2313,8 @@ c = d
         assert_eq!(escape_str(test_whitespace, EscapePolicy::Nothing), test_whitespace);
 
         for policy in vec![
-            EscapePolicy::Basics, EscapePolicy::BasicsUnicode, EscapePolicy::BasicsUnicodeExtended,
-            EscapePolicy::Reserved, EscapePolicy::ReservedUnicode, EscapePolicy::ReservedUnicodeExtended,
+            EscapePolicy::Basics, EscapePolicy::BasicsUnicode,
+            EscapePolicy::Reserved, EscapePolicy::ReservedUnicode,
             EscapePolicy::Everything,
         ] {
             assert_eq!(escape_str(test_backslash, policy), r"\\backslashes\\");
@@ -2355,7 +2334,7 @@ c = d
         // These policies should *not* escape reserved characters.
         for policy in vec![
             EscapePolicy::Nothing,
-            EscapePolicy::Basics, EscapePolicy::BasicsUnicode, EscapePolicy::BasicsUnicodeExtended,
+            EscapePolicy::Basics, EscapePolicy::BasicsUnicode,
         ] {
             assert_eq!(escape_str(test_reserved, policy), ":=;#");
             assert_eq!(escape_str(test_punctuation, policy), test_punctuation);
@@ -2363,7 +2342,7 @@ c = d
 
         // These should.
         for policy in vec![
-            EscapePolicy::Reserved, EscapePolicy::ReservedUnicodeExtended, EscapePolicy::ReservedUnicode,
+            EscapePolicy::Reserved, EscapePolicy::ReservedUnicode,
             EscapePolicy::Everything,
         ] {
             assert_eq!(escape_str(test_reserved, policy), r"\:\=\;\#");
@@ -2395,13 +2374,44 @@ c = d
             assert_eq!(escape_str(test_cjk, policy), test_cjk);
             assert_eq!(escape_str(test_high_points, policy), test_high_points);
         }
+    }
 
-        // UnicodeExtended policies should escape both BMP and supplementary plane characters.
-        for policy in vec![EscapePolicy::BasicsUnicodeExtended, EscapePolicy::ReservedUnicodeExtended] {
-            assert_eq!(escape_str(test_unicode, policy), r"\x00e9\x00a3\x2233\x5b57\x2728");
-            assert_eq!(escape_str(test_emoji, policy), r"\x1f431\x1f609");
-            assert_eq!(escape_str(test_cjk, policy), r"\x2020c\x20547");
-            assert_eq!(escape_str(test_high_points, policy), r"\x10abcd\x10ffff");
+    #[test]
+    fn escape_read_write() {
+        // Ensure that escape sequences are consistent when reading/writing.
+        let input = "[*]
+low_codepoint=☺
+high_codepoint=🐱
+";
+
+        let conf = Ini::load_from_str(&input).unwrap();
+
+        // No unicode escapes:
+        {
+            let mut output = Vec::new();
+            conf.write_to_policy(&mut output, EscapePolicy::Basics).unwrap();
+            let written = String::from_utf8(output).unwrap();
+            let conf2 = Ini::load_from_str(&written).unwrap();
+
+            assert_eq!(input, written);
+            assert_eq!(written.contains("☺"), true);
+            assert_eq!(written.contains("🐱"), true);
+            assert_eq!(conf.get_from(Some("*"), "low_codepoint"), conf2.get_from(Some("*"), "low_codepoint"));
+            assert_eq!(conf.get_from(Some("*"), "high_codepoint"), conf2.get_from(Some("*"), "high_codepoint"));
+        }
+
+        // Escape 4-digit codepoints, letting anything above U+FFFF pass through raw:
+        {
+            let mut output = Vec::new();
+            conf.write_to_policy(&mut output, EscapePolicy::BasicsUnicode).unwrap();
+            let written = String::from_utf8(output).unwrap();
+            let conf2 = Ini::load_from_str(&written).unwrap();
+
+            assert_eq!(input.replace("☺", r"\x263a"), written);
+            assert_eq!(written.contains("☺"), false);
+            assert_eq!(written.contains("🐱"), true);
+            assert_eq!(conf.get_from(Some("*"), "low_codepoint"), conf2.get_from(Some("*"), "low_codepoint"));
+            assert_eq!(conf.get_from(Some("*"), "high_codepoint"), conf2.get_from(Some("*"), "high_codepoint"));
         }
     }
 }
